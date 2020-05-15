@@ -79,7 +79,12 @@ Finally, `t5.data` contains a `Mixture` class that can be instantiated to combin
 
 `t5.models` contains shims for connecting T5 `Tasks` and `Mixtures` to a model implementation for training, evaluation, and inference.
 
-Currently the only available shim is to [Mesh TensorFlow Transformer][mtft] (MeshTF), which enables both data and model parallelism for training massive Transformer models. This also includes a binary for launching the model in MeshTF along with [gin configs][gin] for setting various hyperparameters.
+Currently there are two shims available: One for the [Mesh TensorFlow Transformer][mtft] that we used in our paper and another for the [Hugging Face Transformers library](https://huggingface.co/transformers/).
+The Hugging Face API is currently experimental and subject to change, but provides a simple and easy way to load, fine-tune, and evaluate our pre-trained models using PyTorch on a single GPU.
+If you want to use our largest models on TPUs and/or reproduce the results in our paper, you should use the [MtfModel](https://github.com/google-research/text-to-text-transfer-transformer/tree/master/t5/models/mtf_model.py) API and the `t5_mesh_transformer` binary.
+If you are interested fine-tuning our models on a GPU in PyTorch, you should try the [HfPyTorchModel](https://github.com/google-research/text-to-text-transfer-transformer/tree/master/t5/models/hf_model.py) API.
+Since the HfPyTorchModel is experimental, the remainder of this README assumes usage of the MtfModel and its associated binary.
+A usage example of HfPyTorchModel is available [here](https://github.com/google-research/text-to-text-transfer-transformer/tree/master/t5/models/hf_model.py#L27).
 
 ## Usage
 
@@ -396,6 +401,8 @@ We have released the following checkpoints for pre-trained models described in o
 * **T5-3B** (3 billion parameters): [gs://t5-data/pretrained_models/3B](https://console.cloud.google.com/storage/browser/t5-data/pretrained_models/3B/)
 * **T5-11B** (11 billion parameters): [gs://t5-data/pretrained_models/11B](https://console.cloud.google.com/storage/browser/t5-data/pretrained_models/11B/)
 
+See [here][released_checkpoints] for a list of additional experimental pre-trained model checkpoints.
+
 # How to Cite
 If you extend or use this work, please cite the [paper][paper] where it was introduced:
 
@@ -411,6 +418,7 @@ If you extend or use this work, please cite the [paper][paper] where it was intr
 ```
 
 [paper]: https://arxiv.org/abs/1910.10683
+[released_checkpoints]: https://github.com/google-research/text-to-text-transfer-transformer/blob/master/released_checkpoints.md
 [beam]: https://beam.apache.org
 [c4]: https://www.tensorflow.org/datasets/catalog/c4
 [cc]: https://commoncrawl.org

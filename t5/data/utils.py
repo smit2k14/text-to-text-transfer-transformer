@@ -68,10 +68,6 @@ class DatasetProviderBase(object):
   __metaclass__ = abc.ABCMeta
 
   @abc.abstractproperty
-  def sentencepiece_model_path(self):
-    raise NotImplementedError
-
-  @abc.abstractproperty
   def output_features(self):
     raise NotImplementedError
 
@@ -219,7 +215,10 @@ class LazyTfdsLoader(object):
   def load_shard(self, file_instruction):
     """Returns a dataset for a single shard of the TFDS TFRecord files."""
     ds = self.builder._tfrecords_reader.read_files(  # pylint:disable=protected-access
-        [file_instruction],
+        tfds.core.tfrecords_reader.FileInstructions(
+            file_instructions=[file_instruction],
+            num_examples_per_shard=None,
+        ),
         read_config=tfds.ReadConfig(),
         shuffle_files=False)
     return ds
@@ -235,7 +234,7 @@ class LazyTfdsLoader(object):
 
 
 def encode_string_features(
-    dataset, vocabulary, keys, copy_plaintext=False):
+    dataset, output_features, keys, copy_plaintext=False):
   """Encode specified string features.
 
   Passes through non-string features unchanged. Optionally passes through copy
@@ -243,7 +242,8 @@ def encode_string_features(
 
   Args:
     dataset: a tf.data.Dataset
-    vocabulary: a vocabulary.Vocabulary
+    output_features: a dict of Feature objects; their vocabulary attribute will
+      be used to tokenize the specified features.
     keys: list of strings, keys of features to encode.
     copy_plaintext: bool, whether to pass through copies of plaintext strings
       with a "_plaintext" suffix added to the key.
@@ -264,7 +264,7 @@ def encode_string_features(
       if k in keys and v.dtype == tf.string:
         if copy_plaintext:
           ret["%s_plaintext" % k] = v
-        v = tf.cast(vocabulary.encode_tf(v), tf.int64)
+        v = tf.cast(output_features[k].vocabulary.encode_tf(v), tf.int64)
       ret[k] = v
     return ret
   return dataset.map(my_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
@@ -315,12 +315,14 @@ def get_stats_path(data_dir, split):
 class Feature(object):
   """A container for attributes of output features of data providers."""
 
-  def __init__(self, add_eos=True):
+  def __init__(self, vocabulary, add_eos=True):
     """Create a Feature instance.
 
     Args:
-      add_eos: bool, whether an EOS token should be added to this feature.
+      vocabulary: vocabularies.Vocabulary object to use for tokenization.
+      add_eos: bool, whether an EOS token should be added to this Feature.
     """
+    self.vocabulary = vocabulary
     self.add_eos = add_eos
 
 
@@ -337,14 +339,20 @@ class Task(DatasetProviderBase):
                dataset_fn,
                splits,
                text_preprocessor,
-               sentencepiece_model_path,
-               metric_fns,
+               sentencepiece_model_path=None,
+               metric_fns=None,
                postprocess_fn=None,
                token_preprocessor=None,
                output_features=None,
                num_input_examples=None,
                supports_caching=False):
     """Task constructor.
+
+    Attributes of output features, including the vocabulary used for
+    tokenization, should be provided via the `output_features` argument. If a
+    given feature does not have a vocabulary defined, it will use a
+    `vocabularies.SentencePieceVocabulary` whose SentencePiece model path is
+    given by the `sentencepiece_model_path` argument.
 
     Args:
       name: string, a unique name for the Task. A ValueError will be raised if
@@ -357,10 +365,15 @@ class Task(DatasetProviderBase):
         a tf.data.Dataset of string features and returns a tf.data.Dataset of
         string features. Can be set to None as a no-op. If a list is given,
         they will be executed sequentially.
-      sentencepiece_model_path: string, path to a SentencePiece model file to
-        use for tokenization.
+      sentencepiece_model_path: str or None, path to a SentencePiece model file
+        to use for tokenization when a `Feature` in `output_features` is not
+        supplied that has a vocabulary defined. For provided `Feature`s in
+        `output_features`, this argument will be ignored. If None, use
+        DEFAULT_SPM_PATH.
       metric_fns: list(callable), list of metric functions with the signature
-        `metric_fn(targets, predictions)` to use during evaluation.
+        `metric_fn(targets, predictions)` to use during evaluation. By default
+        (None), an empty list will be used, resulting in no evaluation on this
+        task.
       postprocess_fn: function, a function that takes in decoded model outputs
         (strings) and returns a string which is ready for evaluation using the
         metric functions in `metric_fns`. Can be set to None as a no-op.
@@ -388,6 +401,7 @@ class Task(DatasetProviderBase):
           "Task name '%s' contains invalid characters. Must match regex: %s" % (
               name, _VALID_TASK_NAME_REGEX.pattern))
     _validate_args(dataset_fn, ["split", "shuffle_files"])
+    metric_fns = metric_fns or []
     for metric_fn in metric_fns:
       _validate_args(metric_fn, ["targets", "predictions"])
 
@@ -397,18 +411,23 @@ class Task(DatasetProviderBase):
         [] if text_preprocessor is None else text_preprocessor)
     self._token_preprocessor = (
         [] if token_preprocessor is None else token_preprocessor)
-    self._sentencepiece_model_path = sentencepiece_model_path
     self._metric_fns = metric_fns
     # Use a pass-through if postprocess_fn is not provided
     self._postprocess_fn = postprocess_fn or (lambda x, **unused_kwargs: x)
     self._cache_dir = None
     self._stats = {}
 
+    if hasattr(output_features, "__len__") and not output_features:
+      raise ValueError("output_features must be non-empty.")
     if isinstance(output_features, dict):
       self._output_features = output_features
     elif output_features is None or isinstance(output_features, list):
+      output_features = output_features or _DEFAULT_FEATURE_KEYS
+      default_vocabulary = sentencepiece_vocabulary.SentencePieceVocabulary(
+          sentencepiece_model_file=sentencepiece_model_path or DEFAULT_SPM_PATH
+      )
       self._output_features = {
-          f: Feature() for f in output_features or _DEFAULT_FEATURE_KEYS
+          f: Feature(vocabulary=default_vocabulary) for f in output_features
       }
     else:
       raise ValueError("output_features must be a dict, list of str, or None")
@@ -431,10 +450,6 @@ class Task(DatasetProviderBase):
   @property
   def metric_fns(self):
     return self._metric_fns
-
-  @property
-  def sentencepiece_model_path(self):
-    return self._sentencepiece_model_path
 
   @property
   def output_features(self):
@@ -537,7 +552,7 @@ class Task(DatasetProviderBase):
     dataset = self._preprocess_dataset(
         dataset, self._token_preprocessor,
         sequence_length=sequence_length,
-        vocabulary=self.get_vocabulary())
+        output_features=self.output_features)
     dataset = self._validate_dataset(
         dataset,
         expected_output_type=tf.int64,
@@ -600,10 +615,27 @@ class Task(DatasetProviderBase):
         self._stats[split] = json.load(f)
     return self._stats[split]
 
-  def get_vocabulary(self):
-    """Returns a SentencePieceVocabulary object using the Task's model."""
-    return sentencepiece_vocabulary.SentencePieceVocabulary(
-        self.sentencepiece_model_path)
+  def get_vocabulary(self, feature_name=None):
+    """Returns a Vocabulary object for the provided feature.
+
+    Args:
+      feature_name: str or None, the name of the output feature to get the
+        Vocabulary for. If None is provided, then this function will first check
+        that all features have the same Vocabulary and then return that
+        Vocabulary.
+    Returns: a Vocabulary object.
+    """
+    if feature_name is None:
+      vocabulary = list(self.output_features.values())[0].vocabulary
+      for feature in self.output_features.values():
+        if feature.vocabulary != vocabulary:
+          raise ValueError(
+              "No feature_name was provided to get_vocabulary, but "
+              "output_features have different vocabularies."
+          )
+    else:
+      vocabulary = self.output_features[feature_name].vocabulary
+    return vocabulary
 
   def get_dataset(
       self,
@@ -638,7 +670,7 @@ class Task(DatasetProviderBase):
       ds = self.preprocess_text(ds)
       # Tokenize
       ds = encode_string_features(
-          ds, self.get_vocabulary(), keys=self.output_features,
+          ds, self.output_features, keys=self.output_features,
           copy_plaintext=True)
 
     if (not use_cached and self.num_input_examples(split) and
@@ -872,10 +904,6 @@ class Mixture(DatasetProviderBase):
       raise ValueError(
           "All Tasks in a Mixture must have the same output features."
       )
-    if len(set(t.sentencepiece_model_path for t in self._tasks)) != 1:
-      raise ValueError(
-          "All Tasks in a Mixture must have the same sentencepiece_model_path."
-      )
 
   @property
   def tasks(self):
@@ -894,15 +922,27 @@ class Mixture(DatasetProviderBase):
     # so we can just get the output_features for the 0th task
     return self._tasks[0].output_features
 
-  @property
-  def sentencepiece_model_path(self):
-    # We require all tasks to have the same sentencepiece_model_path in __init__
-    # so we can just get the sentencepiece_model_path for the first task
-    return self._tasks[0].sentencepiece_model_path
+  def _check_same_vocabularies(self):
+    """Throw an Exception if features across tasks have different vocabs."""
+    for name, feature in self._tasks[0].output_features.items():
+      for task in self._tasks[1:]:
+        if task.output_features[name].vocabulary != feature.vocabulary:
+          raise ValueError(
+              "Features across tasks in a mixture must use the same vocabulary."
+          )
 
-  def get_vocabulary(self):
-    """Returns a SentencePieceVocabulary object using the Tasks' model."""
-    return self._tasks[0].get_vocabulary()
+  def get_vocabulary(self, feature_name=None):
+    """Returns a Vocabulary object using the Tasks' model.
+
+    Args:
+      feature_name: str or None, the name of the output feature to get the
+        Vocabulary for. If None is provided, then this function will first check
+        that all features have the same Vocabulary and then return that
+        Vocabulary.
+    Returns: a Vocabulary object.
+    """
+    self._check_same_vocabularies()
+    return self._tasks[0].get_vocabulary(feature_name=feature_name)
 
   def get_dataset(
       self,
@@ -923,6 +963,7 @@ class Mixture(DatasetProviderBase):
         on the fly (use_cached=False).
       compute_stats_empirically: a boolean - does not work on TPU
     """
+    self._check_same_vocabularies()
     tasks = []
     for task in self.tasks:
       if split not in task.splits:

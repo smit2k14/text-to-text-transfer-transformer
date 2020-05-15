@@ -13,28 +13,35 @@
 # limitations under the License.
 
 # Lint as: python3
-"""T5 Model Abstract Base class."""
+"""Abstract Vocabulary."""
 
 import abc
+import gin
 
 
-class T5Model(object):
-  """Abstract Base class for T5 Model API."""
+@gin.configurable
+class Vocabulary(object):
+  """Base class for all vocabularies."""
 
-  __metaclass__ = abc.ABCMeta
-
-  @abc.abstractmethod
-  def train(self, mixture_or_task_name, steps):
-    raise NotImplementedError()
-
-  @abc.abstractmethod
-  def eval(self, mixture_or_task_name):
-    raise NotImplementedError()
+  def __init__(self, extra_ids=0):
+    self._extra_ids = extra_ids
 
   @abc.abstractmethod
-  def predict(self):
-    raise NotImplementedError()
+  def encode(self, s):
+    raise NotImplementedError
 
   @abc.abstractmethod
-  def finetune(self, mixture_or_task_name, finetune_steps):
-    raise NotImplementedError()
+  def decode(self, ids):
+    raise NotImplementedError
+
+  @abc.abstractmethod
+  def encode_tf(self, s):
+    raise NotImplementedError
+
+  @abc.abstractmethod
+  def decode_tf(self, ids):
+    raise NotImplementedError
+
+  @property
+  def extra_ids(self):
+    return self._extra_ids

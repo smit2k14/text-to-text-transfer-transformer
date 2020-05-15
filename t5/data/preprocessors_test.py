@@ -17,6 +17,7 @@
 from absl.testing import absltest
 from t5.data import preprocessors as prep
 from t5.data import test_utils
+from t5.data import utils
 import tensorflow.compat.v1 as tf
 
 tf.disable_v2_behavior()
@@ -488,6 +489,47 @@ class PreprocessorsTest(tf.test.TestCase):
           [i if i != 'X' else out_split.pop(0) for i in inp])
       self.assertEqual(reconstructed, original)
 
+  def test_fill_in_the_blank_sized(self):
+    def _validate_data(data, valid_bins, og_length=15):
+      # Remove the prefix from the start of the input string
+      self.assertTrue(data['inputs'].startswith('fill: '))
+      inp = data['inputs'].replace('fill: ', '')
+      # Split input into chunks according to blank locations.
+      inp_split = inp.split('_')
+      # Make sure that there is exactly one blank (could be at beginning/end).
+      self.assertLen(inp_split, 3)
+      # Make sure reconstruction is accurate.
+      reconstructed = ''.join([inp_split[0], data['targets']] + inp_split[2:])
+      self.assertEqual(reconstructed, original)
+      # Make sure blank size is correctly chosen.
+      blank_bin = int(inp_split[1])
+      self.assertIn(blank_bin, valid_bins)
+      blank_size = len(data['targets'].split())
+      self.assertGreaterEqual(blank_size, min(og_length, valid_bins[0]))
+      self.assertLessEqual(blank_size, valid_bins[-1])
+      return blank_size, blank_bin
+
+    num_tries = 250
+    original = 'This is a long test with lots of words to see if it works ok.'
+    dataset = tf.data.Dataset.from_tensor_slices(
+        {'text': [original] * num_tries})
+    dataset = prep.fill_in_the_blank_sized(dataset, [1, 4])
+    num_outputs = 0
+    for data in test_utils.dataset_as_text(dataset):
+      blank_size, blank_bin = _validate_data(data, [1, 4])
+      if blank_size <= 2:
+        self.assertEqual(blank_bin, 1)
+      else:
+        self.assertEqual(blank_bin, 4)
+      num_outputs += 1
+    self.assertEqual(num_tries, num_outputs)
+
+    # Check case where bin size is larger than text.
+    dataset = tf.data.Dataset.from_tensor_slices(
+        {'text': [original] * num_tries})
+    dataset = prep.fill_in_the_blank_sized(dataset, [1024])
+    self.assertEmpty(list(test_utils.dataset_as_text(dataset)))
+
   def test_prefix_lm(self):
     num_tries = 100
     original = 'This is a long test with lots of words to see if it works ok.'
@@ -819,7 +861,7 @@ class PreprocessorsTest(tf.test.TestCase):
 
     for _ in range(0, 10):
       dataset = prep.trivia_qa_truncate_inputs(
-          og_dataset, vocabulary=None, sequence_length={'inputs': 20})
+          og_dataset, output_features=None, sequence_length={'inputs': 20})
 
       for data in test_utils.dataset_as_text(dataset):
         self.assertLen(data['inputs'], 20)
@@ -834,7 +876,7 @@ class PreprocessorsTest(tf.test.TestCase):
 
     for _ in range(0, 5):
       dataset = prep.trivia_qa_truncate_inputs(
-          og_dataset, vocabulary=None, sequence_length={'inputs': 5})
+          og_dataset, output_features=None, sequence_length={'inputs': 5})
 
       for data in test_utils.dataset_as_text(dataset):
         self.assertLen(data['inputs'], 5)
@@ -856,7 +898,7 @@ class PreprocessorsTest(tf.test.TestCase):
     })
 
     dataset = prep.trivia_qa_truncate_inputs(
-        dataset, vocabulary=None, sequence_length=sequence_length)
+        dataset, output_features=None, sequence_length=sequence_length)
 
     assert_dataset(dataset, {
         'inputs': tf.range(0, 10),
@@ -870,7 +912,7 @@ class PreprocessorsTest(tf.test.TestCase):
     })
 
     dataset = prep.trivia_qa_truncate_inputs(
-        dataset, vocabulary=None, sequence_length=sequence_length)
+        dataset, output_features=None, sequence_length=sequence_length)
 
     assert_dataset(dataset, {
         'inputs': tf.range(20, 30),
@@ -884,7 +926,10 @@ class PreprocessorsTest(tf.test.TestCase):
     })
 
     dataset = prep.trivia_qa_truncate_inputs(
-        no_overlap_dataset, vocabulary=None, sequence_length=sequence_length)
+        no_overlap_dataset,
+        output_features=None,
+        sequence_length=sequence_length
+    )
 
     i = 0
     for data in test_utils.dataset_as_text(dataset):
@@ -900,7 +945,9 @@ class PreprocessorsTest(tf.test.TestCase):
       })
 
       dataset = prep.trivia_qa_truncate_inputs(
-          og_dataset, vocabulary=None, sequence_length=sequence_length)
+          og_dataset, output_features=None,
+          sequence_length=sequence_length
+      )
       for data in test_utils.dataset_as_text(dataset):
         self.assertContainsSubset(data['targets'], data['inputs'])
         self.assertLen(data['inputs'], 10)
@@ -977,6 +1024,49 @@ class PreprocessorsTest(tf.test.TestCase):
     og_dataset = tf.data.Dataset.from_tensor_slices(['a\tb', 'c\td'])
     dataset = prep.parse_tsv(og_dataset, field_names=['f1', 'f2'])
     assert_dataset(dataset, [{'f1': 'a', 'f2': 'b'}, {'f1': 'c', 'f2': 'd'}])
+
+  def test_denoise(self):
+    tf.set_random_seed(55)
+
+    vocab = test_utils.sentencepiece_vocab()
+    target_tokens = vocab.encode('The quick brown fox.')
+
+    # This is what it encodes to.
+    self.assertEqual(
+        target_tokens,
+        [3, 2, 20, 4, 3, 2, 8, 13, 2, 3, 2, 23, 7, 19, 22, 3, 2, 7, 2])
+
+    og_dataset = tf.data.Dataset.from_tensor_slices({
+        'targets': [target_tokens],
+    })
+
+    output_features = {
+        'targets': utils.Feature(vocab),
+    }
+
+    # These are the parameters of denoise in the operative config of 'base'.
+    # Except noise_density, bumped up from 0.15 to 0.3 in order to demonstrate
+    # multiple corrupted spans.
+    denoised_dataset = prep.denoise(
+        og_dataset,
+        output_features,
+        noise_density=0.3,
+        noise_mask_fn=prep.random_spans_noise_mask,
+        inputs_fn=prep.noise_span_to_unique_sentinel,
+        targets_fn=prep.nonnoise_span_to_unique_sentinel)
+
+    # Two spans corrupted, [2] and [22, 3, 2, 7, 2], replaced by unique
+    # sentinels 25 and 24 respectively.
+    assert_dataset(denoised_dataset, [
+        {
+            'inputs': [
+                3, 25, 20, 4, 3, 2, 8, 13, 2, 3, 2, 23, 7, 19, 24
+            ],
+            'targets': [
+                25, 2, 24, 22, 3, 2, 7, 2
+            ],
+        },
+    ])
 
 
 if __name__ == '__main__':
